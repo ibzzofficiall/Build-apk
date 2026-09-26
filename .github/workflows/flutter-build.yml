@@ -1,211 +1,204 @@
-name: Build Android APK
+name: Build Flutter APK
 
 on:
   workflow_dispatch:
     inputs:
-      jobId:
+      zip_url:
+        description: "URL download ZIP project"
         required: true
         type: string
-      userId:
-        required: false
-        type: string
-      payload:
+      tag:
+        description: "Build tag"
         required: true
         type: string
+      build_type:
+        description: "release atau debug"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
 
 permissions:
   contents: read
-
-env:
-  DEBIAN_FRONTEND: noninteractive
+  actions: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2 -Dorg.gradle.jvmargs=-Xmx4g"
+      CI: "true"
+
     steps:
-      - name: Checkout worker repository
-        uses: actions/checkout@v4
+      - name: Checkout helper
+        uses: actions/checkout@v5
 
-      - name: Prepare build tools
+      - name: Download project
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -y >/dev/null
-          sudo apt-get install -y unzip imagemagick >/dev/null
-          java -version
+          rm -rf project_raw project.zip
+          curl --fail --silent --show-error --location             --retry 5 --retry-all-errors --connect-timeout 20 --max-time 1800             -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}"             -H "Accept: application/octet-stream"             "${{ inputs.zip_url }}" -o project.zip
+          test -s project.zip
+          unzip -tq project.zip
+          mkdir -p project_raw
+          unzip -q project.zip -d project_raw
 
-      - name: Parse build payload
-        id: payload
+      - name: Detect project root
+        id: detect_root
         shell: bash
-        env:
-          PAYLOAD: ${{ inputs.payload }}
         run: |
           set -euo pipefail
-          printf '%s' "$PAYLOAD" > payload.json
-          jq -e . payload.json >/dev/null
-          echo "mode=$(jq -r '.mode // empty' payload.json)" >> "$GITHUB_OUTPUT"
-          echo "appName=$(jq -r '.appName // "My App"' payload.json)" >> "$GITHUB_OUTPUT"
-          echo "buildType=$(jq -r '.buildType // "release"' payload.json)" >> "$GITHUB_OUTPUT"
+
+          echo "Scanning extracted project..."
+          find project_raw -maxdepth 5 -type f ( -name "pubspec.yaml" -o -name "gradlew" -o -name "settings.gradle" -o -name "settings.gradle.kts" ) -print | head -50 || true
+
+          ROOT=""
+
+          # Prefer a real Flutter root.
+          while IFS= read -r pubspec; do
+            [ -z "$pubspec" ] && continue
+            candidate="$(dirname "$pubspec")"
+            if [ -d "$candidate/android" ]; then
+              ROOT="$candidate"
+              break
+            fi
+          done < <(find project_raw -type f -name "pubspec.yaml" -print)
+
+          # Flutter project without android directory (flutter can regenerate it).
+          if [ -z "$ROOT" ]; then
+            first_pubspec="$(find project_raw -type f -name "pubspec.yaml" -print -quit || true)"
+            if [ -n "$first_pubspec" ]; then
+              ROOT="$(dirname "$first_pubspec")"
+            fi
+          fi
+
+          # Pure Android fallback.
+          if [ -z "$ROOT" ]; then
+            first_gradle="$(find project_raw -type f -name "gradlew" -print -quit || true)"
+            if [ -n "$first_gradle" ]; then
+              ROOT="$(dirname "$(dirname "$first_gradle")")"
+              [ -f "$ROOT/gradlew" ] || ROOT="$(dirname "$first_gradle")"
+            fi
+          fi
+
+          if [ -z "$ROOT" ]; then
+            echo "::error title=Project root not found::ZIP does not contain pubspec.yaml or an Android Gradle wrapper."
+            echo "PROJECT_ROOT=" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+          ROOT="$(realpath "$ROOT")"
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "project_root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Detected project root: $ROOT"
+          test -f "$ROOT/pubspec.yaml" || test -f "$ROOT/gradlew"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter stable
+        if: env.PROJECT_ROOT != ''
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare project
+        if: env.PROJECT_ROOT != ''
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f pubspec.yaml ]; then
+            flutter --version
+            flutter clean || true
+            flutter pub get
+          fi
+          if [ -f android/gradlew ]; then
+            chmod +x android/gradlew
+          elif [ -f gradlew ]; then
+            chmod +x gradlew
+          fi
 
       - name: Build APK
+        if: env.PROJECT_ROOT != ''
+        working-directory: ${{ env.PROJECT_ROOT }}
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PAYLOAD: ${{ inputs.payload }}
-          JOB_ID: ${{ inputs.jobId }}
         run: |
           set -euo pipefail
-          MODE="${{ steps.payload.outputs.mode }}"
-          APP_NAME="${{ steps.payload.outputs.appName }}"
-          BUILD_TYPE="${{ steps.payload.outputs.buildType }}"
-          mkdir -p work
-
-          download_asset() {
-            local api_url="$1"
-            local output="$2"
-            test -n "$api_url"
-            curl --fail --location --retry 4 --retry-delay 2 \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/octet-stream" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$api_url" -o "$output"
-            test -s "$output"
-          }
-
-          if [ "$MODE" = "url" ]; then
-            rm -rf work/url-app
-            if [ -d assets/android-native-template-safe ]; then
-              cp -R assets/android-native-template-safe work/url-app
+          if [ -f pubspec.yaml ]; then
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              flutter build apk --debug
             else
-              echo "Template Android tidak ada di repository target. Workflow ini membutuhkan assets/android-native-template-safe." >&2
-              exit 3
+              flutter build apk --release
             fi
-            URL=$(jq -r '.url // empty' payload.json)
-            test -n "$URL"
-            ENCODED=$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1][::-1].encode()).decode())' "$URL")
-            APP_ESC=$(python3 -c 'import sys,xml.sax.saxutils; print(xml.sax.saxutils.escape(sys.argv[1]))' "$APP_NAME")
-            sed -i "s/ENCODED_URL_PLACEHOLDER/${ENCODED}/g" work/url-app/app/src/main/java/com/web2apk/app/MainActivity.java
-            sed -i "s#<string name=\"app_name\">.*</string>#<string name=\"app_name\">${APP_ESC}</string>#" work/url-app/app/src/main/res/values/strings.xml
-
-            ICON_URL=$(jq -r '.iconAssetUrl // empty' payload.json)
-            if [ -n "$ICON_URL" ]; then
-              download_asset "$ICON_URL" /tmp/icon.jpg
-              for dir in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
-                mkdir -p "work/url-app/app/src/main/res/mipmap-$dir"
-                size=48
-                case "$dir" in mdpi) size=48;; hdpi) size=72;; xhdpi) size=96;; xxhdpi) size=144;; xxxhdpi) size=192;; esac
-                convert /tmp/icon.jpg -auto-orient -thumbnail "${size}x${size}^" -gravity center -extent "${size}x${size}" "work/url-app/app/src/main/res/mipmap-$dir/ic_launcher.png"
-                cp "work/url-app/app/src/main/res/mipmap-$dir/ic_launcher.png" "work/url-app/app/src/main/res/mipmap-$dir/ic_launcher_round.png"
-              done
-            fi
-            cd work/url-app
-            chmod +x gradlew
-            ./gradlew --no-daemon --stacktrace "assemble$([ "$BUILD_TYPE" = "debug" ] && echo Debug || echo Release)"
-            APK=$(find app/build/outputs/apk -type f -name '*.apk' | head -1)
-
-          elif [ "$MODE" = "zip" ]; then
-            ZIP_URL=$(jq -r '.zipAssetUrl // empty' payload.json)
-            download_asset "$ZIP_URL" work/project.zip
-            rm -rf work/project
-            mkdir -p work/project
-            unzip -q work/project.zip -d work/project
-            PROJECT=$(find work/project -name pubspec.yaml -o -name settings.gradle -o -name settings.gradle.kts | head -1 | xargs -r dirname)
-            test -n "$PROJECT"
-
-            if [ -f "$PROJECT/pubspec.yaml" ]; then
-              cd "$PROJECT"
-              if ! command -v flutter >/dev/null 2>&1; then
-                git clone --depth 1 https://github.com/flutter/flutter.git "$HOME/flutter"
-                export PATH="$HOME/flutter/bin:$PATH"
-              fi
-              flutter --version
-              flutter pub get
-              if [ "$BUILD_TYPE" = "debug" ]; then flutter build apk --debug; else flutter build apk --release; fi
-              APK=$(find build/app/outputs/flutter-apk -type f -name '*.apk' | head -1)
+          elif [ -f gradlew ]; then
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              ./gradlew assembleDebug --no-daemon --stacktrace
             else
-              cd "$PROJECT"
-              chmod +x gradlew || true
-              if [ "$BUILD_TYPE" = "debug" ]; then ./gradlew --no-daemon --stacktrace assembleDebug; else ./gradlew --no-daemon --stacktrace assembleRelease; fi
-              APK=$(find . -path '*/build/outputs/apk/*/*.apk' -type f | head -1)
+              ./gradlew assembleRelease --no-daemon --stacktrace
             fi
-
-          elif [ "$MODE" = "html" ]; then
-            HTML_URL=$(jq -r '.htmlAssetUrl // empty' payload.json)
-            test -n "$HTML_URL"
-            rm -rf work/flutter-app
-            mkdir -p work/flutter-app
-            if ! command -v flutter >/dev/null 2>&1; then
-              git clone --depth 1 https://github.com/flutter/flutter.git "$HOME/flutter"
-              export PATH="$HOME/flutter/bin:$PATH"
+          elif [ -f android/gradlew ]; then
+            cd android
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              ./gradlew assembleDebug --no-daemon --stacktrace
+            else
+              ./gradlew assembleRelease --no-daemon --stacktrace
             fi
-            flutter create --platforms=android --project-name web2apk_app work/flutter-app
-            cd work/flutter-app
-            mkdir -p assets/web
-            download_asset "$HTML_URL" assets/web/index.html
-            ICON_URL=$(jq -r '.iconAssetUrl // empty' payload.json)
-            if [ -n "$ICON_URL" ]; then
-              download_asset "$ICON_URL" /tmp/icon.jpg
-              for dir in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
-                mkdir -p "android/app/src/main/res/mipmap-$dir"
-                size=48
-                case "$dir" in mdpi) size=48;; hdpi) size=72;; xhdpi) size=96;; xxhdpi) size=144;; xxxhdpi) size=192;; esac
-                convert /tmp/icon.jpg -auto-orient -thumbnail "${size}x${size}^" -gravity center -extent "${size}x${size}" "android/app/src/main/res/mipmap-$dir/ic_launcher.png"
-                cp "android/app/src/main/res/mipmap-$dir/ic_launcher.png" "android/app/src/main/res/mipmap-$dir/ic_launcher_round.png"
-              done
-            fi
-            python3 - <<'PY'
-            from pathlib import Path
-            p=Path('pubspec.yaml')
-            s=p.read_text()
-            s=s.replace("dependencies:\n", "dependencies:\n  webview_flutter: ^4.13.0\n")
-            s=s.replace("flutter:\n", "flutter:\n  assets:\n    - assets/web/index.html\n")
-            p.write_text(s)
-            PY
-            cat > lib/main.dart <<'DART'
-            import 'package:flutter/material.dart';
-            import 'package:webview_flutter/webview_flutter.dart';
-            
-            void main() => runApp(const Web2ApkApp());
-            
-            class Web2ApkApp extends StatefulWidget {
-              const Web2ApkApp({super.key});
-              @override State<Web2ApkApp> createState() => _Web2ApkAppState();
-            }
-            class _Web2ApkAppState extends State<Web2ApkApp> {
-              late final WebViewController controller;
-              @override void initState() {
-                super.initState();
-                controller = WebViewController()
-                  ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                  ..setNavigationDelegate(NavigationDelegate())
-                  ..loadFlutterAsset('assets/web/index.html');
-              }
-              @override Widget build(BuildContext context) => MaterialApp(
-                debugShowCheckedModeBanner: false,
-                home: Scaffold(
-                  appBar: AppBar(title: const Text('Web2Apk')),
-                  body: WebViewWidget(controller: controller),
-                ),
-              );
-            }
-            DART
-            flutter pub get
-            if [ "$BUILD_TYPE" = "debug" ]; then flutter build apk --debug; else flutter build apk --release; fi
-            APK=$(find build/app/outputs/flutter-apk -type f -name '*.apk' | head -1)
           else
-            echo "Unsupported build mode: $MODE" >&2
+            echo "::error::Supported Android/Flutter project files were not found."
             exit 2
           fi
 
-          test -n "${APK:-}" && test -f "$APK"
-          mkdir -p output
-          cp "$APK" "output/apk-${JOB_ID}.apk"
+      - name: Recovery build
+        if: failure() && env.PROJECT_ROOT != ''
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Primary build failed. Starting clean recovery build..."
+          if [ -f pubspec.yaml ]; then
+            rm -rf .dart_tool build
+            flutter clean || true
+            flutter pub get
+            flutter build apk --release
+          elif [ -f gradlew ]; then
+            ./gradlew clean --no-daemon
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          elif [ -f android/gradlew ]; then
+            cd android
+            ./gradlew clean --no-daemon
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          else
+            exit 2
+          fi
 
-      - name: Upload APK artifact
+      - name: Locate APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find "$GITHUB_WORKSPACE" -type f -name "*.apk"             ! -path "*/.gradle/*" ! -path "*/.git/*" -print -quit || true)"
+          if [ -z "$APK" ]; then
+            echo "::error title=APK not found::Build finished but no APK was produced."
+            exit 3
+          fi
+          mkdir -p output
+          cp "$APK" output/app.apk
+          ls -lh output/app.apk
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.jobId }}
-          path: output/apk-${{ inputs.jobId }}.apk
+          name: flutter-${{ inputs.build_type }}-${{ inputs.tag }}
+          path: output/app.apk
+          retention-days: 3
           if-no-files-found: error
-          retention-days: 1
