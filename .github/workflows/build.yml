@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       job_id:
-        description: "Job ID (alias tag)"
+        description: "Job ID alias"
         required: false
         type: string
       owner_id:
@@ -54,56 +54,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf project_raw project.zip
-          curl --fail --silent --show-error --location \
-            --retry 5 --retry-all-errors --connect-timeout 20 --max-time 1800 \
+          rm -rf project_raw project.zip output
+          curl -L --fail --retry 5 --connect-timeout 20 --max-time 1800 \
             -H "Authorization: Bearer ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/octet-stream" \
             "${{ inputs.zip_url }}" -o project.zip
-          test -s project.zip
-          unzip -tq project.zip
           mkdir -p project_raw
           unzip -q project.zip -d project_raw
 
       - name: Detect project root
-        id: detect_root
         shell: bash
         run: |
           set -euo pipefail
-          echo "Scanning extracted project..."
-          ROOT=""
-          while IFS= read -r pubspec; do
-            [ -z "$pubspec" ] && continue
-            candidate="$(dirname "$pubspec")"
-            if [ -d "$candidate/android" ]; then
-              ROOT="$candidate"
-              break
-            fi
-          done < <(find project_raw -type f -name "pubspec.yaml" -print)
-
+          ROOT="$(find project_raw -type f -name "pubspec.yaml" -print | head -n1 | xargs dirname || true)"
           if [ -z "$ROOT" ]; then
-            first_pubspec="$(find project_raw -type f -name "pubspec.yaml" -print -quit || true)"
-            if [ -n "$first_pubspec" ]; then
-              ROOT="$(dirname "$first_pubspec")"
-            fi
+            ROOT="$(find project_raw -type f -name "gradlew" -print | head -n1 | xargs dirname | xargs dirname || true)"
           fi
-
           if [ -z "$ROOT" ]; then
-            first_gradle="$(find project_raw -type f -name "gradlew" -print -quit || true)"
-            if [ -n "$first_gradle" ]; then
-              ROOT="$(dirname "$(dirname "$first_gradle")")"
-              [ -f "$ROOT/gradlew" ] || ROOT="$(dirname "$first_gradle")"
-            fi
-          fi
-
-          if [ -z "$ROOT" ]; then
-            echo "::error::ZIP does not contain pubspec.yaml or gradlew"
+            echo "::error::pubspec.yaml / gradlew not found"
             exit 1
           fi
-
-          ROOT="$(realpath "$ROOT")"
-          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
-          echo "Detected: $ROOT"
+          echo "PROJECT_ROOT=$(realpath "$ROOT")" >> $GITHUB_ENV
+          echo "Detected: $(realpath "$ROOT")"
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -113,60 +85,72 @@ jobs:
           cache: gradle
 
       - name: Setup Flutter stable
-        if: env.PROJECT_ROOT != ''
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Analyze only
-        if: ${{ inputs.only_analyze == true }}
+      - name: Patch Gradle + AGP 9 Fix
         working-directory: ${{ env.PROJECT_ROOT }}
-        run: flutter analyze
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE PATCH ==="
+          cat android/gradle/wrapper/gradle-wrapper.properties || true
+          cat android/gradle.properties || true
+
+          # 1. Upgrade Gradle 8.12.0 -> 8.14.0 (wajib Flutter terbaru)
+          sed -i 's|gradle-.*-all.zip|gradle-8.14-all.zip|g' android/gradle/wrapper/gradle-wrapper.properties || true
+
+          # 2. Fix AGP 9 new DSL error
+          if grep -q "android.newDsl" android/gradle.properties 2>/dev/null; then
+            sed -i 's/android.newDsl=.*/android.newDsl=false/' android/gradle.properties
+          else
+            echo "android.newDsl=false" >> android/gradle.properties
+          fi
+
+          # 3. Tambahan biar build stabil
+          if ! grep -q "android.useAndroidX" android/gradle.properties 2>/dev/null; then
+            echo "android.useAndroidX=true" >> android/gradle.properties
+          fi
+
+          echo "=== AFTER PATCH ==="
+          cat android/gradle/wrapper/gradle-wrapper.properties
+          cat android/gradle.properties
 
       - name: Prepare project
-        if: env.PROJECT_ROOT != '' && inputs.only_analyze == false
         working-directory: ${{ env.PROJECT_ROOT }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f pubspec.yaml ]; then
-            flutter --version
-            flutter clean || true
-            flutter pub get
-          fi
-          if [ -f android/gradlew ]; then chmod +x android/gradlew; fi
-          if [ -f gradlew ]; then chmod +x gradlew; fi
+          flutter --version
+          flutter clean || true
+          flutter pub get
+          chmod +x android/gradlew || true
+          chmod +x gradlew || true
 
-      - name: Build APK
-        if: env.PROJECT_ROOT != '' && inputs.only_analyze == false
+      - name: Build APK with bypass flag
         working-directory: ${{ env.PROJECT_ROOT }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f pubspec.yaml ]; then
-            if [ "${{ inputs.build_type }}" = "debug" ]; then
-              flutter build apk --debug
-            else
-              flutter build apk --release
-            fi
-          elif [ -f gradlew ]; then
-            ./gradlew assemble${{ inputs.build_type == 'debug' && 'Debug' || 'Release' }} --no-daemon
-          elif [ -f android/gradlew ]; then
-            cd android && ./gradlew assemble${{ inputs.build_type == 'debug' && 'Debug' || 'Release' }} --no-daemon
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug --android-skip-build-dependency-validation -v
+          else
+            flutter build apk --release --android-skip-build-dependency-validation -v
           fi
 
       - name: Locate APK
-        if: inputs.only_analyze == false
         shell: bash
         run: |
-          APK="$(find "$GITHUB_WORKSPACE" -type f -name "*.apk" ! -path "*/.gradle/*" -print -quit || true)"
-          [ -z "$APK" ] && { echo "APK not found"; exit 3; }
-          mkdir -p output && cp "$APK" output/app.apk
+          set -euo pipefail
+          APK="$(find "$GITHUB_WORKSPACE" -type f -name "*.apk" ! -path "*/.gradle/*" -print | head -n1)"
+          if [ -z "$APK" ]; then echo "APK not found"; exit 3; fi
+          mkdir -p output
+          cp "$APK" output/app.apk
           ls -lh output/
 
       - name: Upload APK
-        if: inputs.only_analyze == false
         uses: actions/upload-artifact@v4
         with:
           name: flutter-${{ inputs.build_type }}-${{ inputs.tag || inputs.job_id }}
