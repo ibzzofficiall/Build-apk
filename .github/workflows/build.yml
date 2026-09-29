@@ -19,6 +19,11 @@ on:
         options:
           - release
           - debug
+      only_analyze:
+        description: "Cuma analyze aja?"
+        required: false
+        default: "false"
+        type: boolean
 
 permissions:
   contents: read
@@ -34,6 +39,12 @@ jobs:
       CI: "true"
 
     steps:
+     - name: Analyze only
+       if: ${{ inputs.only_analyze == true && env.PROJECT_ROOT != '' }}
+       working-directory: ${{ env.PROJECT_ROOT }}
+       run: |
+        flutter analyze
+          
       - name: Checkout helper
         uses: actions/checkout@v5
 
